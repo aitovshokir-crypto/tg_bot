@@ -2,6 +2,7 @@ import asyncio
 import logging
 import aiosqlite
 import os
+import json
 from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -9,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 # --- SOZLAMALAR ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8822913008:AAFNlFturFsjnTgJFN2GJHzMRIeHwFToYTk")
@@ -24,14 +25,12 @@ media_groups = defaultdict(list)
 
 # --- FSM (HOLATLAR) ---
 class Form(StatesGroup):
-    title = State()
-    text = State()
-    photo = State()
-    video = State()
     forward_post = State()
+    edit_title = State()
     edit_text = State()
     edit_photo = State()
     edit_video = State()
+    edit_buttons = State()
 
 # --- BAZA BILAN ISHLASH ---
 async def init_db():
@@ -42,27 +41,35 @@ async def init_db():
                 title TEXT,
                 text_html TEXT,
                 photo_id TEXT,
-                video_id TEXT
+                video_id TEXT,
+                buttons_json TEXT
             )
         """)
         await db.commit()
 
-async def save_template(title, text_html, photo_id, video_id):
+async def create_empty_template():
     async with aiosqlite.connect("bot_data.db") as db:
-        await db.execute(
-            "INSERT INTO templates (title, text_html, photo_id, video_id) VALUES (?, ?, ?, ?)",
-            (title, text_html, photo_id, video_id)
+        cursor = await db.execute("INSERT INTO templates (title) VALUES ('Yangi Shablon')")
+        await db.commit()
+        return cursor.lastrowid
+
+async def save_full_template(title, text_html, photo_id, video_id, buttons_json=None):
+    async with aiosqlite.connect("bot_data.db") as db:
+        cursor = await db.execute(
+            "INSERT INTO templates (title, text_html, photo_id, video_id, buttons_json) VALUES (?, ?, ?, ?, ?)",
+            (title, text_html, photo_id, video_id, buttons_json)
         )
         await db.commit()
+        return cursor.lastrowid
 
 async def get_all_templates():
     async with aiosqlite.connect("bot_data.db") as db:
-        async with db.execute("SELECT id, title FROM templates") as cursor:
+        async with db.execute("SELECT id, title FROM templates ORDER BY id DESC") as cursor:
             return await cursor.fetchall()
 
 async def get_template_by_id(temp_id):
     async with aiosqlite.connect("bot_data.db") as db:
-        async with db.execute("SELECT title, text_html, photo_id, video_id FROM templates WHERE id = ?", (temp_id,)) as cursor:
+        async with db.execute("SELECT title, text_html, photo_id, video_id, buttons_json FROM templates WHERE id = ?", (temp_id,)) as cursor:
             return await cursor.fetchone()
 
 async def update_template_field(temp_id, field, value):
@@ -75,76 +82,124 @@ async def delete_template(temp_id):
         await db.execute("DELETE FROM templates WHERE id = ?", (temp_id,))
         await db.commit()
 
-# --- TUGMALAR ---
+# --- TUGMALARNI QAYTA ISHLASH (JSON) ---
+def parse_inline_buttons(text):
+    """Foydalanuvchi yuborgan matndan tugmalar yasash"""
+    keyboard = []
+    lines = text.strip().split('\n')
+    for line in lines:
+        row = []
+        for btn in line.split('|'):
+            parts = btn.split('-', 1)
+            if len(parts) == 2:
+                row.append({'text': parts[0].strip(), 'url': parts[1].strip()})
+        if row:
+            keyboard.append(row)
+    return json.dumps(keyboard) if keyboard else None
+
+def build_keyboard(buttons_json):
+    """JSON dan InlineKeyboardMarkup yasash"""
+    if not buttons_json: 
+        return None
+    try:
+        data = json.loads(buttons_json)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=btn['text'], url=btn['url']) for btn in row]
+            for row in data
+        ])
+        return kb
+    except:
+        return None
+
+# --- ASOSIY MENYU TUGMALARI ---
 def get_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Yangi shablon (Bo'lib-bo'lib)", callback_data="add_step_by_step")],
+        [InlineKeyboardButton(text="➕ Yangi shablon yaratish", callback_data="create_new")],
         [InlineKeyboardButton(text="📥 Tayyor postdan saqlash", callback_data="add_forward")],
         [InlineKeyboardButton(text="📂 Shablonlar bo'limi", callback_data="list_templates")]
     ])
 
+# --- TAHRIRLASH PANELI (EDITOR) ---
+def get_editor_keyboard(temp_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🏷 Nomni o'zgartirish", callback_data=f"edtitle_{temp_id}"),
+            InlineKeyboardButton(text="📝 Matnni o'zgartirish", callback_data=f"edtext_{temp_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🖼 Rasmni o'zgartirish", callback_data=f"edphoto_{temp_id}"),
+            InlineKeyboardButton(text="🎥 Videoni o'zgartirish", callback_data=f"edvideo_{temp_id}")
+        ],
+        [InlineKeyboardButton(text="🔗 Tugmalarni tahrirlash", callback_data=f"edbtns_{temp_id}")],
+        [InlineKeyboardButton(text="🚀 Kanalga yuborish", callback_data=f"pub_{temp_id}")],
+        [
+            InlineKeyboardButton(text="🗑 Shablonni o'chirish", callback_data=f"del_{temp_id}"),
+            InlineKeyboardButton(text="⬅️ Menyu", callback_data="back_main")
+        ]
+    ])
+
 # --- HANDLERLAR ---
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("👋 **Boshqaruv paneliga xush kelibsiz!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
-
-# --- 1. BO'LIB-BO'LIB YASASH ---
-@dp.callback_query(F.data == "add_step_by_step")
-async def start_step_by_step(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("🏷 **Shablon uchun nom kiriting:**", parse_mode="HTML")
-    await state.set_state(Form.title)
-    await call.answer()
-
-@dp.message(Form.title)
-async def process_title(message: types.Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await message.answer("📝 **1. Shablon uchun matnni yuboring:**", parse_mode="HTML")
-    await state.set_state(Form.text)
-
-@dp.message(Form.text)
-async def process_text(message: types.Message, state: FSMContext):
-    text_html = message.html_text or message.caption_html
-    if not text_html:
-        await message.answer("Iltimos, matn yuboring!")
-        return
-    
-    await state.update_data(text_html=text_html)
-    await message.answer("🖼 **2. Shablon uchun 1 ta rasm yuboring:**")
-    await state.set_state(Form.photo)
-
-@dp.message(Form.photo, F.photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    await state.update_data(photo_id=photo_id)
-    await message.answer("🎥 **3. Shablon uchun 1 ta video yuboring:**")
-    await state.set_state(Form.video)
-
-@dp.message(Form.video, F.video | F.animation | F.document)
-async def process_video(message: types.Message, state: FSMContext):
-    video_id = message.video.file_id if message.video else (message.animation.file_id if message.animation else message.document.file_id)
-
-    data = await state.get_data()
-    await save_template(
-        title=data.get('title'),
-        text_html=data.get('text_html'),
-        photo_id=data.get('photo_id'),
-        video_id=video_id
-    )
-    
     await state.clear()
-    await message.answer("✅ **Shablon muvaffaqiyatli saqlandi!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await message.answer("👋 <b>Boshqaruv paneliga xush kelibsiz!</b>\nO'zingizga kerakli bo'limni tanlang:", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- 2. TAYYOR POSTDAN SAQLASH (ALBOM VA FORWARD MUKAMMAL USHLASH) ---
+# --- 1. BO'SH SHABLON YARATISH VA EDITORGA KIRISH ---
+@dp.callback_query(F.data == "create_new")
+async def create_new_template(call: types.CallbackQuery, state: FSMContext):
+    temp_id = await create_empty_template()
+    await call.answer("Yangi shablon yaratildi!")
+    await show_editor(call.message, temp_id, state)
+
+async def show_editor(message: types.Message, temp_id: int, state: FSMContext):
+    template = await get_template_by_id(temp_id)
+    if not template:
+        await message.answer("❌ Shablon topilmadi.")
+        return
+
+    title, text_html, photo_id, video_id, buttons_json = template
+    
+    # 1. Shablonni ko'rsatamiz
+    await message.answer(f"📋 <b>Shablon:</b> {title}\n👇 <b>Ko'rinishi:</b>", parse_mode="HTML")
+    
+    kb = build_keyboard(buttons_json)
+    text_content = text_html if text_html else ""
+
+    try:
+        if photo_id and video_id:
+            # Rasm va Video bitta postda bo'lsa (Albom)
+            media = [
+                types.InputMediaPhoto(media=photo_id, caption=text_content, parse_mode="HTML"),
+                types.InputMediaVideo(media=video_id)
+            ]
+            await bot.send_media_group(chat_id=message.chat.id, media=media)
+            if kb:
+                await message.answer("👆 <i>(Albom ostidagi tugmalar)</i>", reply_markup=kb, parse_mode="HTML")
+        elif photo_id:
+            await bot.send_photo(chat_id=message.chat.id, photo=photo_id, caption=text_content, parse_mode="HTML", reply_markup=kb)
+        elif video_id:
+            await bot.send_video(chat_id=message.chat.id, video=video_id, caption=text_content, parse_mode="HTML", reply_markup=kb)
+        elif text_content.strip():
+            await bot.send_message(chat_id=message.chat.id, text=text_content, parse_mode="HTML", reply_markup=kb)
+        else:
+            await message.answer("<i>Shablon hozircha bo'sh... O'zgartirish kiritish uchun quyidagi tugmalardan foydalaning.</i>", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"⚠️ Shablonni ko'rsatishda xatolik: {e}")
+
+    # 2. Boshqaruv menyusini chiqaramiz
+    await message.answer("⚙️ <b>Tahrirlash menyusi:</b>\nIstalgan qismini tahrirlang yoki saqlab chiqing.", reply_markup=get_editor_keyboard(temp_id), parse_mode="HTML")
+
+# --- 2. TAYYOR POSTDAN SAQLASH ---
 @dp.callback_query(F.data == "add_forward")
 async def start_forward_save(call: types.CallbackQuery, state: FSMContext):
-    await call.message.answer("📥 **Tayyor postni yuboring yoki forward qiling:**\n(Rasm, video va matni bor postni yuborishingiz mumkin)", parse_mode="HTML")
+    await call.message.answer("📥 <b>Tayyor postni yuboring yoki forward qiling:</b>\n(Barcha rasm, video, matn va tugmalar saqlanadi)", parse_mode="HTML")
     await state.set_state(Form.forward_post)
     await call.answer()
 
-async def save_media_group_data(mg_id, state: FSMContext):
-    await asyncio.sleep(1.2)  # Albomning barcha medisaylari kelib bo'lishini kutamiz
+async def save_media_group_data(mg_id, chat_id, state: FSMContext):
+    await asyncio.sleep(1.5)  # Albom to'liq yetib kelishini kutamiz
     messages = media_groups.pop(mg_id, [])
     if not messages:
         return
@@ -162,31 +217,42 @@ async def save_media_group_data(mg_id, state: FSMContext):
             video_id = msg.video.file_id if msg.video else (msg.animation.file_id if msg.animation else msg.document.file_id)
 
     title = f"Post ({messages[0].date.strftime('%d.%m.%Y %H:%M')})"
-    await save_template(title=title, text_html=text_html or " ", photo_id=photo_id, video_id=video_id)
+    temp_id = await save_full_template(title=title, text_html=text_html, photo_id=photo_id, video_id=video_id)
     await state.clear()
-    await messages[0].answer("✅ **Tayyor post muvaffaqiyatli saqlandi!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await show_editor(messages[0], temp_id, state)
 
 @dp.message(Form.forward_post)
 async def process_forward(message: types.Message, state: FSMContext):
+    # Albom kelsa
     if message.media_group_id:
         mg_id = message.media_group_id
         is_first = len(media_groups[mg_id]) == 0
         media_groups[mg_id].append(message)
         if is_first:
-            asyncio.create_task(save_media_group_data(mg_id, state))
+            asyncio.create_task(save_media_group_data(mg_id, message.chat.id, state))
         return
 
-    # Yakka holda kelgan post uchun:
-    text_html = message.html_text or message.caption_html or " "
+    # Yakkalik xabar kelsa
+    text_html = message.html_text or message.caption_html or ""
     photo_id = message.photo[-1].file_id if message.photo else None
     video_id = message.video.file_id if message.video else (message.animation.file_id if message.animation else None)
+    
+    buttons_json = None
+    if message.reply_markup and message.reply_markup.inline_keyboard:
+        keyboard = []
+        for row in message.reply_markup.inline_keyboard:
+            new_row = [{'text': btn.text, 'url': btn.url} for btn in row if btn.url]
+            if new_row:
+                keyboard.append(new_row)
+        if keyboard:
+            buttons_json = json.dumps(keyboard)
 
     title = f"Post ({message.date.strftime('%d.%m.%Y %H:%M')})"
-    await save_template(title=title, text_html=text_html, photo_id=photo_id, video_id=video_id)
+    temp_id = await save_full_template(title=title, text_html=text_html, photo_id=photo_id, video_id=video_id, buttons_json=buttons_json)
     await state.clear()
-    await message.answer("✅ **Tayyor post muvaffaqiyatli saqlandi!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await show_editor(message, temp_id, state)
 
-# --- 3. SHABLONLAR RO'YXATI VA KO'RISH ---
+# --- 3. SHABLONLAR RO'YXATI ---
 @dp.callback_query(F.data == "list_templates")
 async def list_templates(call: types.CallbackQuery):
     templates = await get_all_templates()
@@ -197,113 +263,146 @@ async def list_templates(call: types.CallbackQuery):
 
     buttons = []
     for temp_id, title in templates:
-        buttons.append([InlineKeyboardButton(text=f"📋 {title}", callback_data=f"view_{temp_id}")])
+        buttons.append([InlineKeyboardButton(text=f"📋 {title}", callback_data=f"open_{temp_id}")])
     
     buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_main")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await call.message.answer("📂 **Mavjud shablonlar ro'yxati:**", reply_markup=kb, parse_mode="HTML")
+    await call.message.answer("📂 <b>Mavjud shablonlar ro'yxati:</b>", reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
-@dp.callback_query(F.data.startswith("view_"))
-async def view_single_template(call: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("open_"))
+async def open_template_editor(call: types.CallbackQuery, state: FSMContext):
     temp_id = int(call.data.split("_")[1])
-    template = await get_template_by_id(temp_id)
-    
-    if not template:
-        await call.message.answer("❌ Shablon topilmadi.")
-        await call.answer()
-        return
-
-    title, text_html, photo_id, video_id = template
-    await call.message.answer(f"📋 **Shablon:** {title}\n\n👇 **Ko'rinishi:**", parse_mode="HTML")
-
-    media = []
-    if photo_id:
-        media.append(types.InputMediaPhoto(media=photo_id))
-    if video_id:
-        media.append(types.InputMediaVideo(media=video_id))
-
-    if media:
-        media[0].caption = text_html
-        media[0].parse_mode = "HTML"
-        await call.message.answer_media_group(media=media)
-    elif text_html.strip():
-        await call.message.answer(text_html, parse_mode="HTML")
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Kanalga chiqarish", callback_data=f"pub_{temp_id}")],
-        [InlineKeyboardButton(text="🖼 Rasmni almashtirish", callback_data=f"edphoto_{temp_id}")],
-        [InlineKeyboardButton(text="🎥 Videoni almashtirish", callback_data=f"edvideo_{temp_id}")],
-        [InlineKeyboardButton(text="✏️ Matnni almashtirish", callback_data=f"edtext_{temp_id}")],
-        [InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del_{temp_id}")],
-        [InlineKeyboardButton(text="⬅️ Ro'yxatga qaytish", callback_data="list_templates")]
-    ])
-    await call.message.answer("⚙️ **Boshqarish menyusi:**", reply_markup=kb, parse_mode="HTML")
     await call.answer()
+    await show_editor(call.message, temp_id, state)
 
-# --- TAHRIRLASH BO'LIMLARI (RASM, VIDEO, MATN) ---
-@dp.callback_query(F.data.startswith("edphoto_"))
-async def edit_photo_start(call: types.CallbackQuery, state: FSMContext):
+# --- 4. TAHRIRLASH JARAYONLARI (FSM) ---
+@dp.callback_query(F.data.startswith("edtitle_"))
+async def edit_title_start(call: types.CallbackQuery, state: FSMContext):
     temp_id = int(call.data.split("_")[1])
     await state.update_data(edit_temp_id=temp_id)
-    await call.message.answer("🖼 **Ushbu shablon uchun yangi RASM yuboring:**", parse_mode="HTML")
-    await state.set_state(Form.edit_photo)
+    await call.message.answer("🏷 <b>Yangi nomni yuboring:</b>", parse_mode="HTML")
+    await state.set_state(Form.edit_title)
     await call.answer()
 
-@dp.message(Form.edit_photo, F.photo)
-async def edit_photo_finish(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
+@dp.message(Form.edit_title)
+async def edit_title_finish(message: types.Message, state: FSMContext):
     data = await state.get_data()
     temp_id = data.get("edit_temp_id")
-
-    await update_template_field(temp_id, "photo_id", photo_id)
+    await update_template_field(temp_id, "title", message.text)
     await state.clear()
-    await message.answer("✅ **Rasm muvaffaqiyatli yangilandi!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("edvideo_"))
-async def edit_video_start(call: types.CallbackQuery, state: FSMContext):
-    temp_id = int(call.data.split("_")[1])
-    await state.update_data(edit_temp_id=temp_id)
-    await call.message.answer("🎥 **Ushbu shablon uchun yangi VIDEO yuboring:**", parse_mode="HTML")
-    await state.set_state(Form.edit_video)
-    await call.answer()
-
-@dp.message(Form.edit_video, F.video | F.animation | F.document)
-async def edit_video_finish(message: types.Message, state: FSMContext):
-    video_id = message.video.file_id if message.video else (message.animation.file_id if message.animation else message.document.file_id)
-    data = await state.get_data()
-    temp_id = data.get("edit_temp_id")
-
-    await update_template_field(temp_id, "video_id", video_id)
-    await state.clear()
-    await message.answer("✅ **Video muvaffaqiyatli yangilandi!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await show_editor(message, temp_id, state)
 
 @dp.callback_query(F.data.startswith("edtext_"))
 async def edit_text_start(call: types.CallbackQuery, state: FSMContext):
     temp_id = int(call.data.split("_")[1])
     await state.update_data(edit_temp_id=temp_id)
-    await call.message.answer("📝 **Ushbu shablon uchun yangi MATN yuboring:**", parse_mode="HTML")
+    await call.message.answer("📝 <b>Yangi matnni yuboring:</b>\n<i>(Tozalash uchun /clear ni yuboring)</i>", parse_mode="HTML")
     await state.set_state(Form.edit_text)
     await call.answer()
 
 @dp.message(Form.edit_text)
 async def edit_text_finish(message: types.Message, state: FSMContext):
-    new_text_html = message.html_text or message.caption_html or " "
     data = await state.get_data()
     temp_id = data.get("edit_temp_id")
-
-    await update_template_field(temp_id, "text_html", new_text_html)
+    new_text = "" if message.text == "/clear" else (message.html_text or message.caption_html or "")
+    
+    await update_template_field(temp_id, "text_html", new_text)
     await state.clear()
-    await message.answer("✅ **Matn muvaffaqiyatli yangilandi!**", reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await show_editor(message, temp_id, state)
 
+@dp.callback_query(F.data.startswith("edphoto_"))
+async def edit_photo_start(call: types.CallbackQuery, state: FSMContext):
+    temp_id = int(call.data.split("_")[1])
+    await state.update_data(edit_temp_id=temp_id)
+    await call.message.answer("🖼 <b>Yangi rasm yuboring:</b>\n<i>(O'chirib tashlash uchun /clear ni yuboring)</i>", parse_mode="HTML")
+    await state.set_state(Form.edit_photo)
+    await call.answer()
+
+@dp.message(Form.edit_photo)
+async def edit_photo_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    temp_id = data.get("edit_temp_id")
+    photo_id = None if message.text == "/clear" else (message.photo[-1].file_id if message.photo else None)
+    
+    if message.text != "/clear" and not photo_id:
+        await message.answer("⚠️ Iltimos rasm yuboring!")
+        return
+
+    await update_template_field(temp_id, "photo_id", photo_id)
+    await state.clear()
+    await show_editor(message, temp_id, state)
+
+@dp.callback_query(F.data.startswith("edvideo_"))
+async def edit_video_start(call: types.CallbackQuery, state: FSMContext):
+    temp_id = int(call.data.split("_")[1])
+    await state.update_data(edit_temp_id=temp_id)
+    await call.message.answer("🎥 <b>Yangi video yuboring:</b>\n<i>(O'chirib tashlash uchun /clear ni yuboring)</i>", parse_mode="HTML")
+    await state.set_state(Form.edit_video)
+    await call.answer()
+
+@dp.message(Form.edit_video)
+async def edit_video_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    temp_id = data.get("edit_temp_id")
+    video_id = None
+    if message.text != "/clear":
+        video_id = message.video.file_id if message.video else (message.animation.file_id if message.animation else message.document.file_id if message.document else None)
+        if not video_id:
+            await message.answer("⚠️ Iltimos video yuboring!")
+            return
+
+    await update_template_field(temp_id, "video_id", video_id)
+    await state.clear()
+    await show_editor(message, temp_id, state)
+
+@dp.callback_query(F.data.startswith("edbtns_"))
+async def edit_buttons_start(call: types.CallbackQuery, state: FSMContext):
+    temp_id = int(call.data.split("_")[1])
+    await state.update_data(edit_temp_id=temp_id)
+    await call.message.answer(
+        "🔗 <b>Tugmalarni yaratish qoidalari:</b>\n\n"
+        "Quyidagi formatda yuboring:\n"
+        "<code>Tugma nomi - https://silka.uz</code>\n\n"
+        "Yoki yonma-yon qilish uchun `|` ishlating:\n"
+        "<code>Kanal 1 - https://t.me/kanal1 | Kanal 2 - https://t.me/kanal2</code>\n\n"
+        "<i>(Tugmalarni butunlay o'chirish uchun /clear ni yuboring)</i>", 
+        parse_mode="HTML"
+    )
+    await state.set_state(Form.edit_buttons)
+    await call.answer()
+
+@dp.message(Form.edit_buttons)
+async def edit_buttons_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    temp_id = data.get("edit_temp_id")
+    
+    if message.text == "/clear":
+        buttons_json = None
+    else:
+        buttons_json = parse_inline_buttons(message.text)
+        if not buttons_json:
+            await message.answer("⚠️ Xato format! Iltimos ko'rsatilgan formatda yuboring.")
+            return
+
+    await update_template_field(temp_id, "buttons_json", buttons_json)
+    await state.clear()
+    await show_editor(message, temp_id, state)
+
+# --- 5. O'CHIRISH, ORQAGA QAYTISH VA KANALGA CHIQARISH ---
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_template_handler(call: types.CallbackQuery):
     temp_id = int(call.data.split("_")[1])
     await delete_template(temp_id)
-    await call.message.answer("🗑 **Shablon o'chirib tashlandi.**", parse_mode="HTML")
+    await call.message.answer("🗑 <b>Shablon o'chirildi.</b>", parse_mode="HTML")
     await list_templates(call)
 
-# --- POSTNI KANALGA CHIQARISH ---
+@dp.callback_query(F.data == "back_main")
+async def back_main(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Boshqaruv paneli:", reply_markup=get_main_keyboard())
+    await call.answer()
+
 @dp.callback_query(F.data.startswith("pub_"))
 async def publish_post_handler(call: types.CallbackQuery):
     temp_id = int(call.data.split("_")[1])
@@ -314,33 +413,40 @@ async def publish_post_handler(call: types.CallbackQuery):
         await call.answer()
         return
 
-    title, text_html, photo_id, video_id = template
+    title, text_html, photo_id, video_id, buttons_json = template
+    kb = build_keyboard(buttons_json)
+    text_content = text_html if text_html else ""
+
     try:
-        media = []
-        if photo_id:
-            media.append(types.InputMediaPhoto(media=photo_id))
-        if video_id:
-            media.append(types.InputMediaVideo(media=video_id))
+        if photo_id and video_id:
+            media = [
+                types.InputMediaPhoto(media=photo_id, caption=text_content, parse_mode="HTML"),
+                types.InputMediaVideo(media=video_id)
+            ]
+            msg = await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            if kb:
+                await bot.send_message(chat_id=CHANNEL_ID, text="👆 Batafsil:", reply_markup=kb, reply_to_message_id=msg[0].message_id)
+        
+        elif photo_id:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=photo_id, caption=text_content, parse_mode="HTML", reply_markup=kb)
+        
+        elif video_id:
+            await bot.send_video(chat_id=CHANNEL_ID, video=video_id, caption=text_content, parse_mode="HTML", reply_markup=kb)
+        
+        elif text_content.strip():
+            await bot.send_message(chat_id=CHANNEL_ID, text=text_content, parse_mode="HTML", reply_markup=kb)
+        
+        else:
+            await call.message.answer("❌ Shablon bo'sh! Yuborish uchun hech narsa yo'q.")
+            return
 
-        if media:
-            media[0].caption = text_html
-            media[0].parse_mode = "HTML"
-            await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
-        elif text_html.strip():
-            await bot.send_message(chat_id=CHANNEL_ID, text=text_html, parse_mode="HTML")
-
-        await call.message.answer("🚀 **Post kanalga muvaffaqiyatli joylandi!**", parse_mode="HTML")
+        await call.message.answer("🚀 <b>Post kanalga muvaffaqiyatli joylandi!</b>", parse_mode="HTML")
     except Exception as e:
         await call.message.answer(f"❌ Xatolik yuz berdi: {e}")
 
     await call.answer()
 
-@dp.callback_query(F.data == "back_main")
-async def back_main(call: types.CallbackQuery):
-    await call.message.answer("Boshqaruv paneli:", reply_markup=get_main_keyboard())
-    await call.answer()
-
-# --- RENDER PORTI ---
+# --- RENDER PORTI (DUMMY SERVER) ---
 async def handle_ping(request):
     return web.Response(text="Bot muvaffaqiyatli ishlamoqda!")
 
