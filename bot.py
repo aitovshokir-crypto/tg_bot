@@ -10,10 +10,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# --- SOZLAMALARNI RENDER'DAN OLISH ---
-BOT_TOKEN = os.getenv("8822913008:AAEQRM4QLiBXOzEV5qj9nt3NAp1tdMrpAxs")
-ADMIN_ID = int(os.getenv("6052580480", 0))
-CHANNEL_ID = int(os.getenv("-1003724147872", 0))
+# --- SOZLAMALAR (TUZATILGAN QISM) ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8822913008:AAEQRM4QLiBXOzEV5qj9nt3NAp1tdMrpAxs")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "6052580480"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003724147872"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -146,23 +146,26 @@ async def publish_post(call: types.CallbackQuery):
     
     await call.answer()
 
-# --- RENDER UCHUN VEB SERVER (DUMMY) ---
+# --- RENDER UCHUN VEB SERVER (PORT XATOLIGINI OLISH UCHUN) ---
 async def handle_ping(request):
     return web.Response(text="Bot muvaffaqiyatli ishlamoqda!")
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await init_db()
-    
-    # 1. Render talab qiladigan Veb-serverni sozlash
+async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await init_db()
+    
+    # 1. Render talab qiladigan Veb-serverni fonda ishga tushirish
+    asyncio.create_task(start_web_server())
     
     # 2. Telegram botni ishga tushirish
     await bot.delete_webhook(drop_pending_updates=True)
@@ -170,4 +173,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                              
+    
