@@ -11,7 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # --- SOZLAMALAR ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8822913008:AAEQRM4QLiBXOzEV5qj9nt3NAp1tdMrpAxs")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8822913008:AAHjqfmkAF6NTlZDz481e3bK46odM7gHtNI")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6052580480"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003724147872"))
 
